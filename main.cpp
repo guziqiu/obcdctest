@@ -351,8 +351,17 @@ void consumer_worker_thread() {
           current_lsn.val_ += group_entry.get_group_entry_size(current_lsn);
         }
       } else {
-        // 心跳包/空数据推进
-        std::cout << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
+        // 心跳包/空数据推进：仅在 LSN 改变或者每隔 5 秒时才打印，防止日志刷屏
+        static uint64_t last_printed_lsn = 0;
+        static int64_t last_printed_time = 0;
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        if (task.lsn.val_ != last_printed_lsn || now_ms - last_printed_time > 5000) {
+          std::cout << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
+          last_printed_lsn = task.lsn.val_;
+          last_printed_time = now_ms;
+        }
       }
 
       // 2. 消费完成后持久化 Checkpoint！故障重启后将由此恢复
@@ -374,8 +383,17 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
     g_rpc_done = false;
     g_rpc_success = false;
 
-    // 主动发起一次 RPC 接口调用
-    std::cout << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
+    // 主动发起一次 RPC 接口调用 (仅在 LSN 改变或者每隔 5 秒时才打印，防止日志刷屏)
+    static uint64_t last_pull_lsn = 0;
+    static int64_t last_pull_time = 0;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if (current_lsn.val_ != last_pull_lsn || now_ms - last_pull_time > 5000) {
+      std::cout << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
+      last_pull_lsn = current_lsn.val_;
+      last_pull_time = now_ms;
+    }
     manager.trigger_fetch(current_lsn);
 
     // 阻塞等待异步回调结果唤醒（收到包、超时、或网络失败）
