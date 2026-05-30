@@ -39,7 +39,10 @@ include_directories(
 # Path to the compiled libobcdc.so inside the container
 set(LIBOBCDC_SO "${OCEANBASE_DIR}/build_debug/src/logservice/libobcdc/src/libobcdc.so")
 
+# Find pthread library
+find_package(Threads REQUIRED)
+
 add_executable(obcdc_rpc_test main.cpp)
 
-# Link against libobcdc.so
-target_link_libraries(obcdc_rpc_test PRIVATE ${LIBOBCDC_SO})
+# Link against libobcdc.so and pthread
+target_link_libraries(obcdc_rpc_test PRIVATE ${LIBOBCDC_SO} Threads::Threads pthread)

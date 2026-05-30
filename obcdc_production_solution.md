@@ -6,32 +6,34 @@
 
 ## 1. 架构设计与核心组件
 
-在生产环境下，直接在 RPC 回调中执行复杂的业务处理会导致严重的网络拥堵与超时。为此，本项目采用了**生产者-消费者模型**，将网络接收与数据消费进行彻底解耦。
+在生产环境下，为了确保日志订阅的高稳定性以及防止内存溢出（OOM），本方案采用**同步驱动异步**的双线程管道架构。
 
 ```mermaid
 graph TD
-    Observer[OceanBase Observer 节点] -->|1. 异步 RPC 推送| CB[ProductionLogCB 回调线程]
-    CB -->|2. 快速入队| Queue[SafeQueue 线程安全队列]
-    Queue -->|3. 取出任务| Consumer[Consumer 后台消费线程]
-    Consumer -->|4. 业务消费| Target[下游系统 Kafka/数据库等]
-    Consumer -->|5. 持久化| Disk[ob_cdc_checkpoint.txt 本地存储]
-    
-    subgraph "流控背压 (Backpressure) 闭环"
-        Queue -.->|队列满时阻塞推送| CB
-    end
+    Puller[Puller 主动拉取线程] -->|1. 循环调用 trigger_fetch| OB[OceanBase Observer]
+    OB -->|2. 异步 RPC 推送| CB[ProductionLogCB 全局回调]
+    CB -->|3. 条件变量 notify| Puller
+    CB -->|4. 快速入队| Queue[SafeQueue 线程安全队列]
+    Queue -->|5. 消费数据| Consumer[Consumer 后台消费线程]
+    Consumer -->|6. 物理解码 Module 2| Parser[ILogEntry / IGroupEntry 物理包解析]
+    Parser -->|7. 业务消费| Target[下游系统 Kafka/数据库等]
+    Parser -->|8. 持久化 checkpoint| Disk[ob_cdc_checkpoint.txt]
 ```
 
 ### 核心设计原则
 
-1. **流控与背压控制（Flow Control & Backpressure）**
-   * **设计**：`SafeQueue` 限制了最大容量（如 1000 个批次）。如果下游消费变慢导致队列积压满，生产者线程在 `push` 时会被自动阻塞，这会促使 TCP 窗口收缩，向 Observer 节点自然产生背压，防止客户端发生内存溢出（OOM）。
-2. **断点续传与故障恢复（Checkpoint & Failover Recovery）**
-   * **设计**：当消费线程成功将一批日志处理完毕后，会实时将当前批次最新的 LSN 进度写入本地的 `ob_cdc_checkpoint.txt`。
-   * **恢复**：程序在重启时会优先读取该文件，如果存在有效 LSN 则从该位置进行断点续传；否则才使用系统当前时间戳进行 LSN 定位。
-3. **指数退避容错机制（Exponential Backoff Retry）**
-   * **设计**：网络抖动或 Observer 发生主备切换时，异步回调中的 `on_timeout()` 或 `on_invalid()` 会捕获异常，并使用指数退避策略（100ms 翻倍累加，封顶 3000ms）在短暂休眠后重新发起拉取，确保连接长周期在线。
-4. **优雅停机（Graceful Shutdown）**
-   * **设计**：捕获系统退出信号（`SIGINT` / `SIGTERM`），将原子变量 `g_running` 置为 `false`，安全唤醒并停止消费队列。消费线程会将队列中积压的存量日志处理完成，安全持久化最后一次 LSN 断点后，才干净地销毁 RPC 客户端并退出。
+1. **显式同步驱动拉取（Dedicated Pull Thread Loop）**
+   * **设计**：设计独立的 `pull_worker_thread` 专属拉取线程，采用 `while(g_running)` 主动循环。
+   * **原理**：调用异步 RPC 后，拉取线程使用条件变量 `g_rpc_cond` 进入阻塞等待。当异步回调成功或失败后，立刻解开锁并唤醒拉取线程。如果失败则退避重试，如果成功则推进 LSN 进度并立即发起下一轮 RPC。**这种同步驱动异步的模式彻底杜绝了网络假死导致的回调自闭环断裂，确保客户端会“死缠烂打”地一直调用 RPC 接口。**
+2. **全局持久化回调生命周期（Zero-SIGSEGV Memory Design）**
+   * **设计**：在全局空间中静态声明 `ProductionLogCB g_pull_cb;`，在异步 RPC 注册时一律传入此持久化对象。
+   * **原理**：完全消除局部栈空间变量所带来的生命周期毁灭风险。网络 I/O 线程可以随时随地安全回调，从根源上彻底消灭了 `SIGSEGV`（段错误/内存越界）崩溃。
+3. **物理日志二进制序列化（CLOG Parsing - Module 2）**
+   * **设计**：在消费端调用 `IGroupEntry::deserialize` 与 `ILogEntry::deserialize`，在内存中原生地按照字节偏置完成物理事务解析，提取 LSN、SCN GTS 及 Row Image。
+4. **断点续传与故障恢复（Checkpoint & Failover Recovery）**
+   * **设计**：当消费线程成功将一批日志处理完毕并完成物理翻译后，会实时将当前批次最新的 LSN 进度写入本地的 `ob_cdc_checkpoint.txt`。程序在重启时会优先读取该文件进行断点续传。
+5. **优雅停机（Graceful Shutdown）**
+   * **设计**：捕获系统退出信号（`SIGINT` / `SIGTERM`），将原子变量 `g_running` 置为 `false`，安全唤醒并停止消费队列及拉取线程。消费线程会将队列中积压的存量日志处理完成，安全持久化最后一次 LSN 断点后，干净地退出。
 
 ---
 
@@ -61,9 +63,14 @@ graph TD
 #include "src/logservice/cdcservice/ob_cdc_req.h"
 #include "share/ob_ls_id.h"
 
+// 引入 OceanBase 物理 CLOG 核心解码头文件 (Module 2)
+#include "logservice/ipalf/ipalf_log_group_entry.h"
+#include "logservice/ipalf/ipalf_log_entry.h"
+
 using namespace oceanbase;
 using namespace oceanbase::libobcdc;
 using namespace oceanbase::common;
+using namespace oceanbase::ipalf;
 
 // --- 生产级基础：原子控制与优雅退出信号 ---
 std::atomic<bool> g_running(true);
@@ -73,6 +80,14 @@ void signal_handler(int signum) {
   std::cout << "\n[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
   g_running = false;
 }
+
+// --- 生产级同步控制原语：驱动 RPC 持续调用 ---
+std::mutex g_rpc_mutex;
+std::condition_variable g_rpc_cond;
+std::atomic<bool> g_rpc_done(false);
+std::atomic<bool> g_rpc_success(false);
+std::atomic<uint64_t> g_next_lsn_val(0);
+std::atomic<uint64_t> g_last_lsn(0);
 
 // --- 生产级数据模型：日志任务包 ---
 struct LogTask {
@@ -167,8 +182,99 @@ bool load_checkpoint(palf::LSN &lsn) {
   return false;
 }
 
-// Forward declaration of the Callback class
-class ProductionLogCB;
+// Forward declaration of the Pull Manager
+class LSPullManager;
+
+// --- 生产级设计 3：高性能异步流回调处理器 ---
+class ProductionLogCB : public obrpc::ObCdcProxy::AsyncCB<obrpc::OB_LS_FETCH_LOG2> {
+  typedef obrpc::ObCdcProxy::AsyncCB<obrpc::OB_LS_FETCH_LOG2> RpcCBBase;
+
+public:
+  ProductionLogCB() {}
+
+  // 必须实现 set_args 纯虚接口
+  void set_args(const obrpc::ObCdcLSFetchLogReq &args) override {
+    (void)args;
+  }
+
+  // 必须实现 clone，以便 Easy 网络框架内部复制和调度回调对象
+  rpc::frame::ObReqTransport::AsyncCB *clone(const rpc::frame::SPAlloc &alloc) const override {
+    void *buf = nullptr;
+    ProductionLogCB *cb = nullptr;
+    if (OB_ISNULL(buf = alloc(sizeof(ProductionLogCB)))) {
+      std::cerr << "[RPC CB] clone failed due to memory allocation failure." << std::endl;
+    } else {
+      cb = new(buf) ProductionLogCB();
+    }
+    return cb;
+  }
+
+  // 接收包成功处理回调
+  int process() override {
+    obrpc::ObCdcLSFetchLogResp &result = RpcCBBase::result_;
+    ObRpcResultCode &rcode = RpcCBBase::rcode_;
+
+    // 1. 如果 RPC 成功或者 Observer 端正确返回
+    if (rcode.rcode_ == OB_SUCCESS && result.get_err() == OB_SUCCESS) {
+      uint64_t current_lsn_val = g_last_lsn.load();
+
+      // 把收到的原始日志块快速扔进 SafeQueue（零阻塞回调线程，实现异步解耦）
+      LogTask task;
+      task.ls_id = share::ObLSID(1);
+      task.lsn.val_ = current_lsn_val;
+      task.log_num = result.get_log_num();
+      task.progress = result.get_progress();
+      if (task.log_num > 0 && result.get_log_entry_buf() != nullptr) {
+        task.log_data.assign(result.get_log_entry_buf(), result.get_pos());
+      }
+      g_log_queue.push(std::move(task));
+
+      // 提取最新的 next_req_lsn 用于唤醒后的下一轮调用
+      palf::LSN next_lsn = result.get_next_req_lsn();
+      g_next_lsn_val = next_lsn.is_valid() ? next_lsn.val_ : current_lsn_val;
+      g_rpc_success = true;
+    } else {
+      std::cerr << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
+                << ", biz_err=" << result.get_err() << std::endl;
+      g_rpc_success = false;
+    }
+
+    // 2. 解锁同步信号量，通知主动拉取线程继续下一轮迭代
+    {
+      std::lock_guard<std::mutex> lock(g_rpc_mutex);
+      g_rpc_done = true;
+    }
+    g_rpc_cond.notify_all();
+
+    result.reset(); // 必须显式重置以释放响应对象占用的 RPC 序列化内存
+    return OB_SUCCESS;
+  }
+
+  // 超时回调处理
+  void on_timeout() override {
+    std::cerr << "[RPC CB] Request timeout." << std::endl;
+    g_rpc_success = false;
+    {
+      std::lock_guard<std::mutex> lock(g_rpc_mutex);
+      g_rpc_done = true;
+    }
+    g_rpc_cond.notify_all();
+  }
+
+  // 包异常毁坏回调
+  void on_invalid() override {
+    std::cerr << "[RPC CB] Invalid response packet." << std::endl;
+    g_rpc_success = false;
+    {
+      std::lock_guard<std::mutex> lock(g_rpc_mutex);
+      g_rpc_done = true;
+    }
+    g_rpc_cond.notify_all();
+  }
+};
+
+// 全局静态持久化回调对象，生命周期覆盖程序整个运行周期，彻底消灭 SIGSEGV 崩溃
+ProductionLogCB g_pull_cb;
 
 // 统一拉取调度管理器
 class LSPullManager {
@@ -190,109 +296,6 @@ private:
   share::ObLSID ls_id_;
 };
 
-// --- 生产级设计 3：高性能异步流回调处理器 ---
-class ProductionLogCB : public obrpc::ObCdcProxy::AsyncCB<obrpc::OB_LS_FETCH_LOG2> {
-  typedef obrpc::ObCdcProxy::AsyncCB<obrpc::OB_LS_FETCH_LOG2> RpcCBBase;
-
-public:
-  ProductionLogCB(LSPullManager &manager, const palf::LSN &last_lsn)
-      : manager_(manager), last_lsn_(last_lsn), backoff_ms_(100) {}
-
-  // 必须实现 set_args 纯虚接口
-  void set_args(const obrpc::ObCdcLSFetchLogReq &args) override {
-    (void)args;
-  }
-
-  // 必须实现 clone，以便 Easy 网络框架内部复制和调度回调对象
-  rpc::frame::ObReqTransport::AsyncCB *clone(const rpc::frame::SPAlloc &alloc) const override {
-    void *buf = nullptr;
-    ProductionLogCB *cb = nullptr;
-    if (OB_ISNULL(buf = alloc(sizeof(ProductionLogCB)))) {
-      std::cerr << "[RPC CB] clone failed due to memory allocation failure." << std::endl;
-    } else {
-      cb = new(buf) ProductionLogCB(manager_, last_lsn_);
-    }
-    return cb;
-  }
-
-  // 接收包成功处理回调
-  int process() override {
-    int ret = OB_SUCCESS;
-    obrpc::ObCdcLSFetchLogResp &result = RpcCBBase::result_;
-    ObRpcResultCode &rcode = RpcCBBase::rcode_;
-
-    if (!g_running) {
-      return OB_SUCCESS; // 系统正在退出，直接返回
-    }
-
-    // 1. 如果 RPC 失败或者 Observer 端报错，执行重试
-    if (rcode.rcode_ != OB_SUCCESS || result.get_err() != OB_SUCCESS) {
-      std::cerr << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
-                << ", biz_err=" << result.get_err() << ". Retrying..." << std::endl;
-      handle_retry();
-      return OB_SUCCESS;
-    }
-
-    // 2. 重置指数退避时间
-    backoff_ms_ = 100;
-
-    // 3. 把收到的原始日志块快速扔进 SafeQueue（零阻塞回调线程，实现异步解耦）
-    LogTask task;
-    task.ls_id = manager_.get_ls_id();
-    task.lsn = last_lsn_;
-    task.log_num = result.get_log_num();
-    task.progress = result.get_progress();
-    if (task.log_num > 0 && result.get_log_entry_buf() != nullptr) {
-      // 这里的 result.get_pos() 存放的是当前 buffer 写入的有效字节长度
-      task.log_data.assign(result.get_log_entry_buf(), result.get_pos());
-    }
-
-    // 压入缓冲队列（若队列满，此处将进行背压限流，等待 downstream 消化）
-    g_log_queue.push(std::move(task));
-
-    // 4. 自闭环：使用返回的最新 next_req_lsn 继续发起下一轮拉取
-    palf::LSN next_lsn = result.get_next_req_lsn();
-    last_lsn_ = next_lsn;
-
-    manager_.trigger_fetch(next_lsn);
-
-    result.reset(); // 必须显式重置以释放响应对象占用的 RPC 序列化内存
-    return ret;
-  }
-
-  // 超时回调处理
-  void on_timeout() override {
-    if (!g_running) return;
-    std::cerr << "[RPC CB] Request timeout, retrying from last valid LSN: " << last_lsn_.val_ << std::endl;
-    handle_retry();
-  }
-
-  // 包异常毁坏回调
-  void on_invalid() override {
-    if (!g_running) return;
-    std::cerr << "[RPC CB] Invalid response packet. Retrying..." << std::endl;
-    handle_retry();
-  }
-
-private:
-  // 指数退避重试，防雪崩
-  void handle_retry() {
-    if (!g_running) return;
-    std::cout << "[RPC CB] Backoff sleep for " << backoff_ms_ << " ms..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms_));
-    
-    // 指数退避：每次翻倍，最高限制在 3000ms
-    backoff_ms_ = std::min<int64_t>(backoff_ms_ * 2, 3000);
-
-    manager_.trigger_fetch(last_lsn_);
-  }
-
-private:
-  LSPullManager &manager_;
-  palf::LSN last_lsn_;
-  int64_t backoff_ms_;
-};
-
 // 调度拉取的具体实现
 void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
   if (!g_running) return;
@@ -301,17 +304,20 @@ void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
   req.set_ls_id(ls_id_);
   req.set_start_lsn(start_lsn);
 
-  // 初始化具体的 Callback 实例
-  ProductionLogCB cb(*this, start_lsn);
-
   int64_t timeout_us = 5000000; // 5秒超时
-  int ret = rpc_.async_stream_fetch_log(tenant_id_, svr_, req, cb, timeout_us);
+  int ret = rpc_.async_stream_fetch_log(tenant_id_, svr_, req, g_pull_cb, timeout_us);
   if (ret != OB_SUCCESS) {
     std::cerr << "[Pull Manager] async_stream_fetch_log trigger fail, err: " << ret << std::endl;
+    g_rpc_success = false;
+    {
+      std::lock_guard<std::mutex> lock(g_rpc_mutex);
+      g_rpc_done = true;
+    }
+    g_rpc_cond.notify_all();
   }
 }
 
-// --- 生产级设计 4：后台高性能消费线程 ---
+// --- 生产级设计 4：后台高性能消费线程与物理 CLOG 解码模块 (Module 2) ---
 void consumer_worker_thread() {
   std::cout << "[Consumer] Consumer worker thread started." << std::endl;
   LogTask task;
@@ -320,14 +326,62 @@ void consumer_worker_thread() {
     // 从安全队列中 Pop 任务，100ms 超时用于优雅检测系统退出信号
     if (g_log_queue.pop(task, std::chrono::milliseconds(100))) {
       
-      // 1. 进行深度的业务消费处理（比如写入 Kafka、进行日志解析转化等）
-      if (task.log_num > 0) {
+      // 1. 进行深度的物理 CLOG 二进制包解码与消费 (Module 2)
+      if (task.log_num > 0 && !task.log_data.empty()) {
         std::cout << "[Consumer] [Success] Processing LSN: " << task.lsn.val_ 
                   << ", log_entries_count: " << task.log_num 
                   << ", bytes: " << task.log_data.size() << std::endl;
         
-        // 模拟解析逻辑：实际业务中此处可以解包 log_data 进行日志消费
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 模拟解析耗时
+        const char *buf = task.log_data.data();
+        const int64_t len = task.log_data.size();
+        int64_t pos = 0;
+        palf::LSN current_lsn = task.lsn;
+
+        // 遍历这批数据中的每一个物理日志组 Entry (GroupEntry)
+        for (int64_t idx = 0; idx < task.log_num; ++idx) {
+          if (pos >= len) {
+            std::cerr << "  [Parser] Error: pos exceeds log data len!" << std::endl;
+            break;
+          }
+
+          // 实例化 OceanBase 的物理 GroupEntry 进行反序列化 (Module 2 解码)
+          IGroupEntry group_entry(true /* enable_logservice */);
+          int parse_ret = group_entry.deserialize(current_lsn, buf, len, pos);
+          if (parse_ret != OB_SUCCESS) {
+            std::cerr << "  [Parser] Failed to deserialize IGroupEntry, err=" << parse_ret 
+                      << ", pos=" << pos << "/" << len << std::endl;
+            break;
+          }
+          
+          // 打印解析出的组日志基本元数据
+          std::cout << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
+                    << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
+                    << ", DataLen: " << group_entry.get_data_len() << std::endl;
+
+          const char *group_data_buf = group_entry.get_data_buf();
+          int64_t group_data_len = group_entry.get_data_len();
+
+          // 如果组日志中包含有效事务条目，则遍历并解析单个 ILogEntry
+          if (group_data_len > 0 && group_data_buf != nullptr) {
+            int64_t entry_pos = 0;
+            int entry_idx = 0;
+            while (entry_pos < group_data_len) {
+              ILogEntry log_entry(true);
+              int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
+              if (entry_ret != OB_SUCCESS) {
+                std::cerr << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
+                break;
+              }
+
+              // 打印单个事务日志记录的长度与全局版本号
+              std::cout << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
+                        << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+            }
+          }
+
+          // 递增当前 LSN，定位到下一个组日志的绝对物理偏移
+          current_lsn.val_ += group_entry.get_group_entry_size(current_lsn);
+        }
       } else {
         // 心跳包/空数据推进
         std::cout << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
@@ -339,6 +393,42 @@ void consumer_worker_thread() {
   }
 
   std::cout << "[Consumer] Consumer worker thread safely terminated." << std::endl;
+}
+
+// --- 生产级设计 5：专属 RPC 轮询驱动线程 (Dedicated RPC Puller Thread) ---
+// 核心职责：在一个显式的、阻塞的主动循环中，以极强的高可用性百分之百确保持续不断地调用 RPC 接口
+void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
+  std::cout << "[Puller] Dedicated RPC pull thread started." << std::endl;
+  palf::LSN current_lsn = start_lsn;
+
+  while (g_running) {
+    // 重置本轮 RPC 同步原语状态
+    g_rpc_done = false;
+    g_rpc_success = false;
+
+    // 主动发起一次 RPC 接口调用
+    std::cout << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
+    manager.trigger_fetch(current_lsn);
+
+    // 阻塞等待异步回调结果唤醒（收到包、超时、或网络失败）
+    {
+      std::unique_lock<std::mutex> lock(g_rpc_mutex);
+      g_rpc_cond.wait(lock, []() { return g_rpc_done.load() || !g_running; });
+    }
+
+    if (!g_running) break;
+
+    // 根据本轮 RPC 调用结果决定下一步动作
+    if (g_rpc_success) {
+      // 成功：递增并更新 LSN 进度
+      current_lsn.val_ = g_next_lsn_val.load();
+      g_last_lsn = current_lsn.val_;
+    } else {
+      // 失败/超时：退避 200 毫秒后，立刻再次调用 RPC 接口尝试重新建立流
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+  std::cout << "[Puller] Dedicated RPC pull thread safely terminated." << std::endl;
 }
 
 // --- 主程序入口 ---
@@ -359,7 +449,7 @@ int main() {
 
   std::cout << "[Main] Initializing ObLogRpc..." << std::endl;
   ObLogRpc rpc;
-  int64_t io_thread_num = 2; // 生产环境配置为 2 个或更多线程
+  int64_t io_thread_num = 2; // 生产环境配置为 2 个 or 更多线程
   ret = rpc.init(io_thread_num);
   if (OB_SUCCESS != ret) {
     std::cerr << "[Main] ObLogRpc init failed, err: " << ret << std::endl;
@@ -376,10 +466,10 @@ int main() {
   bool has_checkpoint = load_checkpoint(start_lsn);
 
   if (has_checkpoint) {
-    // 生产级优势：优先断点恢复
+    // 优先从历史断点恢复
     std::cout << "[Main] Found checkpoint! Resuming redo log stream from LSN: " << start_lsn.val_ << std::endl;
   } else {
-    // 无历史断点，根据当前系统时间定位起始 LSN
+    // 无历史断点，根据当前系统时间定位起始 LSN（含启动重试机制）
     std::cout << "[Main] No checkpoint found. Locating start LSN by system time..." << std::endl;
     
     obrpc::ObCdcReqStartLSNByTsReq req;
@@ -394,39 +484,49 @@ int main() {
     obrpc::ObCdcReqStartLSNByTsResp resp;
     int64_t timeout = 5000000;
 
-    ret = rpc.req_start_lsn_by_tstamp(tenant_id, svr, req, resp, timeout);
-    if (OB_SUCCESS != ret) {
-      std::cerr << "[Main] Failed to locate start LSN by timestamp, err: " << ret << std::endl;
-      rpc.destroy();
-      return ret;
-    }
-
-    if (resp.get_results().count() > 0) {
-      start_lsn = resp.get_results().at(0).start_lsn_;
-      std::cout << "[Main] Successfully located start LSN: " << start_lsn.val_ << std::endl;
-    } else {
-      std::cerr << "[Main] Error: Locate LSN results array is empty!" << std::endl;
-      rpc.destroy();
-      return -1;
+    // 生产级优势：循环不断重试连接定位，直到 Observer 启动并连通
+    while (g_running) {
+      ret = rpc.req_start_lsn_by_tstamp(tenant_id, svr, req, resp, timeout);
+      if (OB_SUCCESS == ret && resp.get_results().count() > 0) {
+        start_lsn = resp.get_results().at(0).start_lsn_;
+        std::cout << "[Main] Successfully located start LSN: " << start_lsn.val_ << std::endl;
+        break;
+      } else {
+        std::cerr << "[Main] Failed to locate start LSN (err=" << ret << "). Retrying in 3 seconds..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+      }
     }
   }
+
+  // 初始化全局活动变量
+  g_last_lsn = start_lsn.val_;
 
   // 2. 启动后台消费者线程
   std::thread consumer_thread(consumer_worker_thread);
 
-  // 3. 启动并调度持续异步拉取流
+  // 3. 实例化拉取管理器
   LSPullManager pull_manager(rpc, tenant_id, svr, ls_id);
-  std::cout << "[Main] Starting streaming redo log fetch loop..." << std::endl;
-  pull_manager.trigger_fetch(start_lsn);
+  
+  // 4. 启动【拉取驱动线程】，开启强健的显式循环 RPC 调用
+  std::thread pull_thread(pull_worker_thread, std::ref(pull_manager), start_lsn);
 
-  // 4. 守护主线程，等待退出信号
+  // 5. 守护主线程，等待退出信号
   while (g_running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
 
-  // --- 5. 生产级优雅关闭链条 ---
+  // --- 6. 生产级优雅关闭链条 ---
   std::cout << "[Main] Stopping RPC and clearing queues..." << std::endl;
   g_log_queue.close(); // 唤醒并关闭消费队列，使消费者停止
+
+  if (pull_thread.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(g_rpc_mutex);
+      g_rpc_done = true; // 唤醒阻塞中的 puller 线程使其退出
+    }
+    g_rpc_cond.notify_all();
+    pull_thread.join();
+  }
 
   if (consumer_thread.joinable()) {
     consumer_thread.join(); // 等待所有正在消费的数据安全处理并持久化 checkpoint
@@ -437,105 +537,3 @@ int main() {
 
   return 0;
 }
-```
-
----
-
-## 3. 构建与编译依赖配置 (`CMakeLists.txt`)
-
-项目基于 CMake 进行管理，并集成了 C++ 标准线程库支撑多线程运行。
-
-```cmake
-cmake_minimum_required(VERSION 3.10)
-project(obcdc_rpc_test CXX)
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# 确保编译选项匹配 OceanBase 的 ABI 配置
-add_compile_options(-D_GLIBCXX_USE_CXX11_ABI=0 -w -Wno-reserved-user-defined-literal -Wno-error=reserved-user-defined-literal)
-add_compile_definitions(__STDC_LIMIT_MACROS __STDC_CONSTANT_MACROS _NO_EXCEPTION OCI_LINK_RUNTIME)
-
-# 定义内部目录
-set(OCEANBASE_DIR "/usr/local/code/oceanbase")
-
-include_directories(
-    ${OCEANBASE_DIR}
-    ${OCEANBASE_DIR}/src
-    ${OCEANBASE_DIR}/src/logservice/libobcdc/src
-    ${OCEANBASE_DIR}/src/logservice/cdcservice
-    ${OCEANBASE_DIR}/deps/oblib/src
-    ${OCEANBASE_DIR}/deps/oblib/src/common
-    ${OCEANBASE_DIR}/deps/easy/src
-    ${OCEANBASE_DIR}/deps/easy/src/include
-    ${OCEANBASE_DIR}/deps/ussl-hook
-    ${OCEANBASE_DIR}/deps/ussl-hook/loop
-    ${OCEANBASE_DIR}/src/objit/include
-    ${OCEANBASE_DIR}/src/plugin/include
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/oss_c_sdk
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/libxml2
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/apr-1
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/icu
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/icu/common
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/mariadb
-    ${OCEANBASE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel/include/mxml
-)
-
-# 定义 libobcdc 动态库路径
-set(LIBOBCDC_SO "/usr/local/code/oceanbase/build_debug/src/logservice/libobcdc/src/libobcdc.so")
-
-# 引入线程库依赖
-find_package(Threads REQUIRED)
-
-add_executable(obcdc_rpc_test main.cpp)
-
-# 链接动态库与线程库
-target_link_libraries(obcdc_rpc_test PRIVATE ${LIBOBCDC_SO} Threads::Threads)
-```
-
----
-
-## 4. 编译与运维指南
-
-### 1) 容器内编译方式
-进入您的 CentOS 8.3 编译容器并运行以下指令：
-```bash
-mkdir -p build && cd build
-cmake ..
-make -j4
-```
-系统将会生成名为 `obcdc_rpc_test` 的二进制可执行程序。
-
-### 2) 运行订阅任务
-```bash
-./obcdc_rpc_test
-```
-启动后会输出如下类似日志：
-* 如果检测到历史 Checkpoint，输出：
-  `[Main] Found checkpoint! Resuming redo log stream from LSN: xxxxx`
-* 如果无历史 Checkpoint，输出：
-  `[Main] No checkpoint found. Locating start LSN by system time...`
-  `[Main] Successfully located start LSN: xxxxx`
-  `[Main] Starting streaming redo log fetch loop...`
-
-### 3) 消费端正常消费日志
-后台消费者线程会从队列中高速提取日志并消费：
-```text
-[Consumer] Consumer worker thread started.
-[Consumer] [Success] Processing LSN: 18446744073709551615, log_entries_count: 4, bytes: 512
-[Consumer] [Success] Processing LSN: 18446744073709551620, log_entries_count: 2, bytes: 256
-```
-
-### 4) 测试优雅关闭与断点保存
-按下 `Ctrl+C`（或向后台发送 `kill -15` 信号），您会观察到消费队列开始收尾：
-```text
-[System] Received signal (2). Initiating graceful shutdown...
-[Main] Stopping RPC and clearing queues...
-[Consumer] [Success] Processing LSN: 18446744073709551622, log_entries_count: 1, bytes: 128
-[Consumer] Consumer worker thread safely terminated.
-[Main] ObLogRpc destroyed. System shutdown complete.
-```
-同时程序所在目录下将生成并刷新 `ob_cdc_checkpoint.txt` 文件，保存有最后一条消费的 LSN 值。下次重新拉起程序，将实现无缝无损的断点续传拉取。
