@@ -321,29 +321,52 @@ void consumer_worker_thread() {
             break;
           }
           
-          // 打印解析出的组日志基本元数据
-          std::cout << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
-                    << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
-                    << ", DataLen: " << group_entry.get_data_len() << std::endl;
-
           const char *group_data_buf = group_entry.get_data_buf();
           int64_t group_data_len = group_entry.get_data_len();
 
-          // 如果组日志中包含有效事务条目，则遍历并解析单个 ILogEntry
-          if (group_data_len > 0 && group_data_buf != nullptr) {
-            int64_t entry_pos = 0;
-            int entry_idx = 0;
-            while (entry_pos < group_data_len) {
-              ILogEntry log_entry(true);
-              int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
-              if (entry_ret != OB_SUCCESS) {
-                std::cerr << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
-                break;
-              }
+          // 判断是否是 Paxos 协议自身的共识心跳日志 (一般 GroupEntry 负载长度为 66 字节)
+          bool is_paxos_heartbeat = (group_data_len == 66);
 
-              // 打印单个事务日志记录的长度与全局版本号
-              std::cout << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
-                        << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+          if (is_paxos_heartbeat) {
+            // Paxos 心跳日志：限流为每 60 秒打印一次 "paxos alive" 状态，防止刷屏
+            static int64_t last_paxos_time = 0;
+            int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (now_ms - last_paxos_time > 60000) {
+              std::cout << "[Consumer] [Paxos Alive] LSN: " << current_lsn.val_
+                        << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts() << std::endl;
+              last_paxos_time = now_ms;
+            }
+
+            // 静默反序列化，仅推进指针而不输出详细树结构
+            if (group_data_len > 0 && group_data_buf != nullptr) {
+              int64_t entry_pos = 0;
+              while (entry_pos < group_data_len) {
+                ILogEntry log_entry(true);
+                int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
+                if (entry_ret != OB_SUCCESS) break;
+              }
+            }
+          } else {
+            // 真实的业务/用户数据日志 (DML/DDL)：立即打印详细解析结构
+            std::cout << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
+                      << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
+                      << ", DataLen: " << group_entry.get_data_len() << std::endl;
+
+            if (group_data_len > 0 && group_data_buf != nullptr) {
+              int64_t entry_pos = 0;
+              int entry_idx = 0;
+              while (entry_pos < group_data_len) {
+                ILogEntry log_entry(true);
+                int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
+                if (entry_ret != OB_SUCCESS) {
+                  std::cerr << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
+                  break;
+                }
+
+                std::cout << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
+                          << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+              }
             }
           }
 
