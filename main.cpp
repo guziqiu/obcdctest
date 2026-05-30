@@ -45,7 +45,7 @@ std::atomic<bool> g_running(true);
 
 // 优雅关机信号处理函数
 void signal_handler(int signum) {
-  std::cout << "\n" << get_time_prefix() << "[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
+  std::cout << get_time_prefix() << "\n[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
   g_running = false;
 }
 
@@ -411,15 +411,13 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
     g_rpc_done = false;
     g_rpc_success = false;
 
-    // 主动发起一次 RPC 接口调用 (仅在 LSN 改变或者每隔 60 秒时才打印，防止日志刷屏)
-    static uint64_t last_pull_lsn = 0;
+    // 主动发起一次 RPC 接口调用 (严格每 60 秒时间间隔打印一次，防止日志刷屏)
     static int64_t last_pull_time = 0;
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    if (current_lsn.val_ != last_pull_lsn || now_ms - last_pull_time > 60000) {
+    if (now_ms - last_pull_time > 60000) {
       std::cout << get_time_prefix() << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
-      last_pull_lsn = current_lsn.val_;
       last_pull_time = now_ms;
     }
     manager.trigger_fetch(current_lsn);
