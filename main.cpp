@@ -12,6 +12,7 @@
 #include <fstream>
 #include <new>
 #include <algorithm>
+#include <iomanip>
 
 #include "src/logservice/libobcdc/src/ob_log_rpc.h"
 #include "src/logservice/libobcdc/src/ob_log_config.h"
@@ -28,19 +29,24 @@ using namespace oceanbase::libobcdc;
 using namespace oceanbase::common;
 using namespace oceanbase::ipalf;
 
+// --- 生产级基础：时间戳获取辅助函数 (精确到秒) ---
+inline std::string get_time_prefix() {
+  auto now = std::chrono::system_clock::now();
+  auto now_time_t = std::chrono::system_clock::to_time_t(now);
+  struct tm tm_buf;
+  localtime_r(&now_time_t, &tm_buf);
+  char buf[32];
+  strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tm_buf);
+  return std::string(buf);
+}
+
 // --- 生产级基础：原子控制与优雅退出信号 ---
 std::atomic<bool> g_running(true);
 
 // 优雅关机信号处理函数
 void signal_handler(int signum) {
-  std::cout << "\n[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
+  std::cout << "\n" << get_time_prefix() << "[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
   g_running = false;
-}
-
-// 辅助时间函数（微秒时间戳）
-inline int64_t get_timestamp() {
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // --- 生产级同步控制原语：驱动 RPC 持续调用 ---
@@ -164,7 +170,7 @@ public:
     void *buf = nullptr;
     ProductionLogCB *cb = nullptr;
     if (OB_ISNULL(buf = alloc(sizeof(ProductionLogCB)))) {
-      std::cerr << "[RPC CB] clone failed due to memory allocation failure." << std::endl;
+      std::cerr << get_time_prefix() << "[RPC CB] clone failed due to memory allocation failure." << std::endl;
     } else {
       cb = new(buf) ProductionLogCB();
     }
@@ -196,7 +202,7 @@ public:
       g_next_lsn_val = next_lsn.is_valid() ? next_lsn.val_ : current_lsn_val;
       g_rpc_success = true;
     } else {
-      std::cerr << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
+      std::cerr << get_time_prefix() << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
                 << ", biz_err=" << result.get_err() << std::endl;
       g_rpc_success = false;
     }
@@ -214,7 +220,7 @@ public:
 
   // 超时回调处理
   void on_timeout() override {
-    std::cerr << "[RPC CB] Request timeout." << std::endl;
+    std::cerr << get_time_prefix() << "[RPC CB] Request timeout." << std::endl;
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -225,7 +231,7 @@ public:
 
   // 包异常毁坏回调
   void on_invalid() override {
-    std::cerr << "[RPC CB] Invalid response packet." << std::endl;
+    std::cerr << get_time_prefix() << "[RPC CB] Invalid response packet." << std::endl;
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -274,8 +280,7 @@ void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
   int64_t timeout_us = 5000000; // 5秒超时
   int ret = rpc_.async_stream_fetch_log(tenant_id_, svr_, req, g_pull_cb, timeout_us);
   if (ret != OB_SUCCESS) {
-    std::cerr << "[Pull Manager] async_stream_fetch_log trigger fail, err: " << ret << std::endl;
-    // 发送失败也需要解开等待锁，避免拉取线程死锁
+    std::cerr << get_time_prefix() << "[Pull Manager] async_stream_fetch_log trigger fail, err: " << ret << std::endl;
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -287,7 +292,7 @@ void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
 
 // --- 生产级设计 4：后台高性能消费线程与物理 CLOG 解码模块 (Module 2) ---
 void consumer_worker_thread() {
-  std::cout << "[Consumer] Consumer worker thread started." << std::endl;
+  std::cout << get_time_prefix() << "[Consumer] Consumer worker thread started." << std::endl;
   LogTask task;
   
   while (g_running || !g_log_queue.empty()) {
@@ -296,7 +301,7 @@ void consumer_worker_thread() {
       
       // 1. 进行深度的物理 CLOG 二进制包解码与消费 (Module 2)
       if (task.log_num > 0 && !task.log_data.empty()) {
-        std::cout << "[Consumer] [Success] Processing LSN: " << task.lsn.val_ 
+        std::cout << get_time_prefix() << "[Consumer] [Success] Processing LSN: " << task.lsn.val_ 
                   << ", log_entries_count: " << task.log_num 
                   << ", bytes: " << task.log_data.size() << std::endl;
         
@@ -308,7 +313,7 @@ void consumer_worker_thread() {
         // 遍历这批数据中的每一个物理日志组 Entry (GroupEntry)
         for (int64_t idx = 0; idx < task.log_num; ++idx) {
           if (pos >= len) {
-            std::cerr << "  [Parser] Error: pos exceeds log data len!" << std::endl;
+            std::cerr << get_time_prefix() << "  [Parser] Error: pos exceeds log data len!" << std::endl;
             break;
           }
 
@@ -316,7 +321,7 @@ void consumer_worker_thread() {
           IGroupEntry group_entry(true /* enable_logservice */);
           int parse_ret = group_entry.deserialize(current_lsn, buf, len, pos);
           if (parse_ret != OB_SUCCESS) {
-            std::cerr << "  [Parser] Failed to deserialize IGroupEntry, err=" << parse_ret 
+            std::cerr << get_time_prefix() << "  [Parser] Failed to deserialize IGroupEntry, err=" << parse_ret 
                       << ", pos=" << pos << "/" << len << std::endl;
             break;
           }
@@ -333,7 +338,7 @@ void consumer_worker_thread() {
             int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             if (now_ms - last_paxos_time > 60000) {
-              std::cout << "[Consumer] [Paxos Alive] LSN: " << current_lsn.val_
+              std::cout << get_time_prefix() << "[Consumer] [Paxos Alive] LSN: " << current_lsn.val_
                         << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts() << std::endl;
               last_paxos_time = now_ms;
             }
@@ -349,7 +354,7 @@ void consumer_worker_thread() {
             }
           } else {
             // 真实的业务/用户数据日志 (DML/DDL)：立即打印详细解析结构
-            std::cout << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
+            std::cout << get_time_prefix() << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
                       << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
                       << ", DataLen: " << group_entry.get_data_len() << std::endl;
 
@@ -360,11 +365,11 @@ void consumer_worker_thread() {
                 ILogEntry log_entry(true);
                 int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
                 if (entry_ret != OB_SUCCESS) {
-                  std::cerr << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
+                  std::cerr << get_time_prefix() << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
                   break;
                 }
 
-                std::cout << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
+                std::cout << get_time_prefix() << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
                           << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
               }
             }
@@ -381,7 +386,7 @@ void consumer_worker_thread() {
             std::chrono::system_clock::now().time_since_epoch()).count();
 
         if (task.lsn.val_ != last_printed_lsn || now_ms - last_printed_time > 60000) {
-          std::cout << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
+          std::cout << get_time_prefix() << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
           last_printed_lsn = task.lsn.val_;
           last_printed_time = now_ms;
         }
@@ -392,13 +397,13 @@ void consumer_worker_thread() {
     }
   }
 
-  std::cout << "[Consumer] Consumer worker thread safely terminated." << std::endl;
+  std::cout << get_time_prefix() << "[Consumer] Consumer worker thread safely terminated." << std::endl;
 }
 
 // --- 生产级设计 5：专属 RPC 轮询驱动线程 (Dedicated RPC Puller Thread) ---
 // 核心职责：在一个显式的、阻塞的主动循环中，以极强的高可用性百分之百确保持续不断地调用 RPC 接口
 void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
-  std::cout << "[Puller] Dedicated RPC pull thread started." << std::endl;
+  std::cout << get_time_prefix() << "[Puller] Dedicated RPC pull thread started." << std::endl;
   palf::LSN current_lsn = start_lsn;
 
   while (g_running) {
@@ -413,7 +418,7 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
         std::chrono::system_clock::now().time_since_epoch()).count();
 
     if (current_lsn.val_ != last_pull_lsn || now_ms - last_pull_time > 60000) {
-      std::cout << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
+      std::cout << get_time_prefix() << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
       last_pull_lsn = current_lsn.val_;
       last_pull_time = now_ms;
     }
@@ -437,7 +442,7 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
   }
-  std::cout << "[Puller] Dedicated RPC pull thread safely terminated." << std::endl;
+  std::cout << get_time_prefix() << "[Puller] Dedicated RPC pull thread safely terminated." << std::endl;
 }
 
 // --- 主程序入口 ---
@@ -448,23 +453,23 @@ int main() {
 
   int ret = OB_SUCCESS;
 
-  std::cout << "[Main] Setting self address..." << std::endl;
+  std::cout << get_time_prefix() << "[Main] Setting self address..." << std::endl;
   get_self_addr().set_ip_addr("127.0.0.1", static_cast<int32_t>(getpid()));
 
-  std::cout << "[Main] Initializing ObLogConfig..." << std::endl;
+  std::cout << get_time_prefix() << "[Main] Initializing ObLogConfig..." << std::endl;
   TCONF.init();
   std::map<std::string, std::string> configs;
   TCONF.load_from_map(configs);
 
-  std::cout << "[Main] Initializing ObLogRpc..." << std::endl;
+  std::cout << get_time_prefix() << "[Main] Initializing ObLogRpc..." << std::endl;
   ObLogRpc rpc;
   int64_t io_thread_num = 2; // 生产环境配置为 2 个 or 更多线程
   ret = rpc.init(io_thread_num);
   if (OB_SUCCESS != ret) {
-    std::cerr << "[Main] ObLogRpc init failed, err: " << ret << std::endl;
+    std::cerr << get_time_prefix() << "[Main] ObLogRpc init failed, err: " << ret << std::endl;
     return ret;
   }
-  std::cout << "[Main] ObLogRpc initialized successfully!" << std::endl;
+  std::cout << get_time_prefix() << "[Main] ObLogRpc initialized successfully!" << std::endl;
 
   // 定位所需参数
   uint64_t tenant_id = 1002;
@@ -476,10 +481,10 @@ int main() {
 
   if (has_checkpoint) {
     // 优先从历史断点恢复
-    std::cout << "[Main] Found checkpoint! Resuming redo log stream from LSN: " << start_lsn.val_ << std::endl;
+    std::cout << get_time_prefix() << "[Main] Found checkpoint! Resuming redo log stream from LSN: " << start_lsn.val_ << std::endl;
   } else {
     // 无历史断点，根据当前系统时间定位起始 LSN（含启动重试机制）
-    std::cout << "[Main] No checkpoint found. Locating start LSN by system time..." << std::endl;
+    std::cout << get_time_prefix() << "[Main] No checkpoint found. Locating start LSN by system time..." << std::endl;
     
     obrpc::ObCdcReqStartLSNByTsReq req;
     obrpc::ObCdcReqStartLSNByTsReq::LocateParam param;
@@ -498,10 +503,10 @@ int main() {
       ret = rpc.req_start_lsn_by_tstamp(tenant_id, svr, req, resp, timeout);
       if (OB_SUCCESS == ret && resp.get_results().count() > 0) {
         start_lsn = resp.get_results().at(0).start_lsn_;
-        std::cout << "[Main] Successfully located start LSN: " << start_lsn.val_ << std::endl;
+        std::cout << get_time_prefix() << "[Main] Successfully located start LSN: " << start_lsn.val_ << std::endl;
         break;
       } else {
-        std::cerr << "[Main] Failed to locate start LSN (err=" << ret << "). Retrying in 3 seconds..." << std::endl;
+        std::cerr << get_time_prefix() << "[Main] Failed to locate start LSN (err=" << ret << "). Retrying in 3 seconds..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(3));
       }
     }
@@ -525,7 +530,7 @@ int main() {
   }
 
   // --- 6. 生产级优雅关闭链条 ---
-  std::cout << "[Main] Stopping RPC and clearing queues..." << std::endl;
+  std::cout << get_time_prefix() << "[Main] Stopping RPC and clearing queues..." << std::endl;
   g_log_queue.close(); // 唤醒并关闭消费队列，使消费者停止
 
   if (pull_thread.joinable()) {
@@ -542,7 +547,7 @@ int main() {
   }
 
   rpc.destroy(); // 销毁 RPC 服务，断开与 Observer 的网络连接
-  std::cout << "[Main] ObLogRpc destroyed. System shutdown complete." << std::endl;
+  std::cout << get_time_prefix() << "[Main] ObLogRpc destroyed. System shutdown complete." << std::endl;
 
   return 0;
 }
