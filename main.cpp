@@ -12,8 +12,9 @@
 #include <fstream>
 #include <new>
 #include <algorithm>
-#include <iomanip>
 
+#include "cdc_log_parser.h"
+#include "logging_utils.h"
 #include "src/logservice/libobcdc/src/ob_log_rpc.h"
 #include "src/logservice/libobcdc/src/ob_log_config.h"
 #include "src/logservice/libobcdc/src/ob_log_trace_id.h"
@@ -23,22 +24,13 @@
 // 引入 OceanBase 物理 CLOG 核心解码头文件 (Module 2)
 #include "logservice/ipalf/ipalf_log_group_entry.h"
 #include "logservice/ipalf/ipalf_log_entry.h"
+#include "logservice/ob_log_base_type.h"
 
 using namespace oceanbase;
 using namespace oceanbase::libobcdc;
 using namespace oceanbase::common;
 using namespace oceanbase::ipalf;
-
-// --- 生产级基础：时间戳获取辅助函数 (精确到秒) ---
-inline std::string get_time_prefix() {
-  auto now = std::chrono::system_clock::now();
-  auto now_time_t = std::chrono::system_clock::to_time_t(now);
-  struct tm tm_buf;
-  localtime_r(&now_time_t, &tm_buf);
-  char buf[32];
-  strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tm_buf);
-  return std::string(buf);
-}
+using namespace oceanbase::logservice;
 
 // --- 生产级基础：原子控制与优雅退出信号 ---
 std::atomic<bool> g_running(true);
@@ -124,11 +116,16 @@ private:
 SafeQueue<LogTask> g_log_queue(1000);
 
 // --- 生产级设计 2：断点续传（持久化 Checkpoint） ---
-const std::string CHECKPOINT_FILE = "ob_cdc_checkpoint.txt";
+std::string g_checkpoint_file = "ob_cdc_checkpoint.txt";
+
+void set_checkpoint_file(const uint64_t tenant_id, const share::ObLSID &ls_id) {
+  g_checkpoint_file = "ob_cdc_checkpoint_t" + std::to_string(tenant_id)
+                    + "_ls" + std::to_string(ls_id.id()) + ".txt";
+}
 
 // 写入 LSN 断点到本地存储文件
 void save_checkpoint(const palf::LSN &lsn) {
-  std::ofstream fs(CHECKPOINT_FILE, std::ios::trunc);
+  std::ofstream fs(g_checkpoint_file, std::ios::trunc);
   if (fs.is_open()) {
     fs << lsn.val_;
     fs.close();
@@ -137,7 +134,7 @@ void save_checkpoint(const palf::LSN &lsn) {
 
 // 启动时加载历史 LSN 断点，实现故障恢复
 bool load_checkpoint(palf::LSN &lsn) {
-  std::ifstream fs(CHECKPOINT_FILE);
+  std::ifstream fs(g_checkpoint_file);
   if (fs.is_open()) {
     uint64_t val = 0;
     if (fs >> val) {
@@ -301,10 +298,6 @@ void consumer_worker_thread() {
       
       // 1. 进行深度的物理 CLOG 二进制包解码与消费 (Module 2)
       if (task.log_num > 0 && !task.log_data.empty()) {
-        std::cout << get_time_prefix() << "[Consumer] [Success] Processing LSN: " << task.lsn.val_ 
-                  << ", log_entries_count: " << task.log_num 
-                  << ", bytes: " << task.log_data.size() << std::endl;
-        
         const char *buf = task.log_data.data();
         const int64_t len = task.log_data.size();
         int64_t pos = 0;
@@ -353,11 +346,8 @@ void consumer_worker_thread() {
               }
             }
           } else {
-            // 真实的业务/用户数据日志 (DML/DDL)：立即打印详细解析结构
-            std::cout << get_time_prefix() << "  [Parser] [GroupEntry " << idx << "] LSN: " << current_lsn.val_
-                      << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
-                      << ", DataLen: " << group_entry.get_data_len() << std::endl;
-
+            // 只输出 DDL/DML 相关日志。其他 OceanBase 内部物理日志静默消费并推进 checkpoint。
+            bool printed_group_header = false;
             if (group_data_len > 0 && group_data_buf != nullptr) {
               int64_t entry_pos = 0;
               int entry_idx = 0;
@@ -369,8 +359,26 @@ void consumer_worker_thread() {
                   break;
                 }
 
-                std::cout << get_time_prefix() << "    -> [LogEntry " << entry_idx++ << "] DataLen: " << log_entry.get_data_len()
-                          << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+                ObLogBaseType log_type = INVALID_LOG_BASE_TYPE;
+                if (parse_log_base_type(log_entry, log_type) && is_visible_cdc_log_type(log_type)) {
+                  if (log_type == TRANS_SERVICE_LOG_BASE_TYPE) {
+                    parse_tx_redo_logs(log_entry, current_lsn);
+                  } else if (!printed_group_header) {
+                    std::cout << get_time_prefix() << "[Consumer] [" << cdc_log_kind(log_type)
+                              << "] LSN: " << current_lsn.val_
+                              << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
+                              << ", log_entries_count: " << task.log_num
+                              << ", bytes: " << task.log_data.size()
+                              << ", GroupDataLen: " << group_entry.get_data_len() << std::endl;
+                    printed_group_header = true;
+
+                    std::cout << get_time_prefix() << "    -> [LogEntry " << entry_idx << "] type="
+                              << log_base_type_name(log_type)
+                              << ", DataLen: " << log_entry.get_data_len()
+                              << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+                  }
+                }
+                ++entry_idx;
               }
             }
           }
@@ -379,16 +387,21 @@ void consumer_worker_thread() {
           current_lsn.val_ += group_entry.get_group_entry_size(current_lsn);
         }
       } else {
-        // 心跳包/空数据推进：仅在 LSN 改变或者每隔 60 秒时才打印，防止日志刷屏
+        // 心跳包/空数据推进：严格按时间限流打印，LSN 高频推进时不刷屏。
         static uint64_t last_printed_lsn = 0;
         static int64_t last_printed_time = 0;
+        static uint64_t suppressed_keepalive_count = 0;
         int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
-        if (task.lsn.val_ != last_printed_lsn || now_ms - last_printed_time > 60000) {
-          std::cout << get_time_prefix() << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_ << std::endl;
+        ++suppressed_keepalive_count;
+        if (last_printed_time == 0 || now_ms - last_printed_time > 60000) {
+          std::cout << get_time_prefix() << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_
+                    << ", suppressed=" << (suppressed_keepalive_count - 1)
+                    << ", previous_lsn=" << last_printed_lsn << std::endl;
           last_printed_lsn = task.lsn.val_;
           last_printed_time = now_ms;
+          suppressed_keepalive_count = 0;
         }
       }
 
@@ -470,9 +483,11 @@ int main() {
   std::cout << get_time_prefix() << "[Main] ObLogRpc initialized successfully!" << std::endl;
 
   // 定位所需参数
-  uint64_t tenant_id = 1002;
-  ObAddr svr(ObAddr::IPV4, "127.0.0.1", 10001);
-  share::ObLSID ls_id(1);
+  uint64_t tenant_id = 1006;
+  ObAddr svr(ObAddr::IPV4, "192.168.31.205", 2882);
+  share::ObLSID ls_id(1001);
+  set_checkpoint_file(tenant_id, ls_id);
+  std::cout << get_time_prefix() << "[Main] Using checkpoint file: " << g_checkpoint_file << std::endl;
 
   palf::LSN start_lsn;
   bool has_checkpoint = load_checkpoint(start_lsn);

@@ -42,7 +42,10 @@ set(LIBOBCDC_SO "${OCEANBASE_DIR}/build_debug/src/logservice/libobcdc/src/libobc
 # Find pthread library
 find_package(Threads REQUIRED)
 
-add_executable(obcdc_rpc_test main.cpp)
+add_executable(obcdc_rpc_test
+    main.cpp
+    cdc_log_parser.cpp
+)
 
 # Link against libobcdc.so and pthread
 target_link_libraries(obcdc_rpc_test PRIVATE ${LIBOBCDC_SO} Threads::Threads pthread)
