@@ -9,9 +9,9 @@
 ## 1. 核心架构与技术亮点
 
 * 🔄 **同步驱动异步（Sync-over-Async Pull Thread）**
-  设计专属 `pull_thread` 轮询线程，通过条件变量 `g_rpc_cond` 锁与网络回调同步。不论发生丢包、网络假死或 Observer 超时，都会强制、无休止地发起 RPC 请求（调用 `async_stream_fetch_log`），确保接口“永不断流”。
-* 🛡️ **全局静态持久化回调（Zero-SIGSEGV Callback）**
-  采用全局生命周期对象 `g_pull_cb` 进行 RPC 回调绑定，完全剔除局部栈变量带来的内存销毁隐患，从根源消灭 `SIGSEGV`（段错误/内存损坏）崩溃。
+  设计专属 `pull_thread` 轮询线程，通过 `PullState` 中的条件变量与网络回调同步。不论发生丢包、网络假死或 Observer 超时，都会强制、无休止地发起 RPC 请求（调用 `async_stream_fetch_log`），确保接口“永不断流”。
+* 🛡️ **持久化回调依赖（Zero-SIGSEGV Callback）**
+  `ProductionLogCB` 由主流程创建并持有稳定生命周期，RPC 框架内部 `clone()` 时会复制其 `PullState`、队列和运行状态依赖，避免局部栈变量销毁导致的回调悬挂问题。
 * 📝 **物理日志原生解码（Module 2 CLOG Parser）**
   直接在消费线程端导入 `logservice/ipalf/` 核心结构体，原生地顺序调用 `IGroupEntry::deserialize` 与 `ILogEntry::deserialize` 反序列化二进制字节流，提取 LSN、SCN GTS 时间戳等物理元数据。
 * 💾 **毫秒级断点续传（LSN Checkpoint）**
@@ -33,19 +33,31 @@
 ├── app/
 │   ├── cdc_config.cpp                      # 命令行参数解析与默认配置生成
 │   └── cdc_config.h                        # CDC 启动配置结构体
-├── build.sh                                # CentOS 8.3 容器内快速编译脚本
 ├── cdc_log_parser.cpp                      # CLOG/事务 redo/DML mutator 解析与日志输出
 ├── cdc_log_parser.h                        # 日志解析入口声明
 ├── logging_utils.h                         # 时间前缀工具
 ├── main.cpp                                # CDC 客户端主流程：RPC 生命周期、拉取线程、消费线程
 ├── parser/
 │   └── dml_event.h                         # DML 行事件结构，预留 schema/列值扩展边界
+├── rpc/
+│   ├── ls_pull_manager.cpp                 # 构造并发起 OB_LS_FETCH_LOG2 异步 RPC
+│   ├── ls_pull_manager.h                   # LS 拉取管理器接口
+│   ├── production_log_cb.cpp               # RPC 异步回调：响应转 LogTask、推进 PullState
+│   ├── production_log_cb.h                 # RPC 回调接口
+│   ├── pull_state.cpp                      # 拉取线程和 RPC 回调之间的同步状态
+│   └── pull_state.h                        # PullState 状态接口
 ├── runtime/
 │   ├── checkpoint_store.cpp                # LSN checkpoint 读写
 │   ├── checkpoint_store.h                  # checkpoint 存储接口
 │   ├── logger.cpp                          # 线程安全日志实现，支持终端和文件输出
 │   ├── logger.h                            # CDC_INFO/CDC_ERROR 日志接口
 │   └── safe_queue.h                        # 带背压的线程安全阻塞队列
+├── worker/
+│   ├── consumer_worker.cpp                 # 消费线程：GroupEntry/ILogEntry 分流、心跳限流、checkpoint 保存
+│   ├── consumer_worker.h                   # 消费线程入口声明
+│   ├── log_task.h                          # RPC 回调和消费线程之间传递的日志任务
+│   ├── pull_worker.cpp                     # 生产者线程：循环触发 RPC、等待回调、推进 LSN
+│   └── pull_worker.h                       # 生产者线程入口声明
 ├── obcdc_production_solution.md            # 深度生产环境设计与架构原理方案手册
 ├── plan.md                                 # 自研 CDC 方案规划草稿
 └── docs/superpowers/plans/
@@ -66,16 +78,11 @@ ob_cdc_checkpoint_t<tenant>_ls<ls>.txt      # 默认 LSN 断点文件
 
 本项目代码挂载在 CentOS 8.3 容器中进行交叉编译。
 
-### 1) 进入编译容器并切换至目录
+### 1) 使用容器执行编译
 ```bash
-cd /usr/local/code/obcdctest
+docker exec centos8.3 bash -lc 'cd /usr/local/code/obcdctest/build && rm -rf ./* && cmake ../ && make -j4'
 ```
 
-### 2) 运行编译脚本
-```bash
-mkdir -p build && cd build
-bash ../build.sh
-```
 *编译成功后，将在 `build` 目录下生成可执行程序 `./obcdc_rpc_test`。*
 
 ---

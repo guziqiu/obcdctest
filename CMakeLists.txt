@@ -51,8 +51,13 @@ add_executable(obcdc_rpc_test
     main.cpp
     app/cdc_config.cpp
     cdc_log_parser.cpp
+    rpc/ls_pull_manager.cpp
+    rpc/production_log_cb.cpp
+    rpc/pull_state.cpp
     runtime/checkpoint_store.cpp
     runtime/logger.cpp
+    worker/consumer_worker.cpp
+    worker/pull_worker.cpp
 )
 
 # Link against libobcdc.so and pthread
