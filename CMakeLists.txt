@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
+
+set(CMAKE_C_COMPILER "/usr/local/code/oceanbase/deps/3rd/usr/local/oceanbase/devtools/bin/clang")
+set(CMAKE_CXX_COMPILER "/usr/local/code/oceanbase/deps/3rd/usr/local/oceanbase/devtools/bin/clang++-17")
+
 project(obcdc_rpc_test CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -14,6 +18,7 @@ add_compile_definitions(__STDC_LIMIT_MACROS __STDC_CONSTANT_MACROS _NO_EXCEPTION
 set(OCEANBASE_DIR "/usr/local/code/oceanbase")
 
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${OCEANBASE_DIR}
     ${OCEANBASE_DIR}/src
     ${OCEANBASE_DIR}/src/logservice/libobcdc/src
@@ -44,7 +49,10 @@ find_package(Threads REQUIRED)
 
 add_executable(obcdc_rpc_test
     main.cpp
+    app/cdc_config.cpp
     cdc_log_parser.cpp
+    runtime/checkpoint_store.cpp
+    runtime/logger.cpp
 )
 
 # Link against libobcdc.so and pthread

@@ -1,4 +1,3 @@
-#include <iostream>
 #include <map>
 #include <chrono>
 #include <string>
@@ -6,15 +5,17 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
 #include <atomic>
 #include <csignal>
-#include <fstream>
 #include <new>
 #include <algorithm>
 
+#include "app/cdc_config.h"
 #include "cdc_log_parser.h"
 #include "logging_utils.h"
+#include "runtime/checkpoint_store.h"
+#include "runtime/logger.h"
+#include "runtime/safe_queue.h"
 #include "src/logservice/libobcdc/src/ob_log_rpc.h"
 #include "src/logservice/libobcdc/src/ob_log_config.h"
 #include "src/logservice/libobcdc/src/ob_log_trace_id.h"
@@ -37,7 +38,7 @@ std::atomic<bool> g_running(true);
 
 // 优雅关机信号处理函数
 void signal_handler(int signum) {
-  std::cout << get_time_prefix() << "\n[System] Received signal (" << signum << "). Initiating graceful shutdown..." << std::endl;
+  CDC_INFO() << get_time_prefix() << "\n[System] Received signal (" << signum << "). Initiating graceful shutdown...";
   g_running = false;
 }
 
@@ -58,94 +59,11 @@ struct LogTask {
   share::ObLSID ls_id;
 };
 
-// --- 生产级设计 1：线程安全的高性能阻塞队列（含背压控制） ---
-template <typename T>
-class SafeQueue {
-public:
-  SafeQueue(size_t max_size) : max_size_(max_size), closed_(false) {}
-
-  bool push(T &&item) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    // 当队列满时，阻塞生产者线程实现“背压 (Backpressure)”控制，防止 OOM
-    cond_push_.wait(lock, [this]() { return queue_.size() < max_size_ || closed_ || !g_running; });
-    if (closed_ || !g_running) return false;
-    queue_.push(std::move(item));
-    cond_pop_.notify_one();
-    return true;
-  }
-
-  bool pop(T &item, std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (!cond_pop_.wait_for(lock, timeout, [this]() { return !queue_.empty() || closed_ || !g_running; })) {
-      return false; // 等待超时
-    }
-    if (queue_.empty()) return false;
-    item = std::move(queue_.front());
-    queue_.pop();
-    cond_push_.notify_one(); // 唤醒被阻塞的生产者
-    return true;
-  }
-
-  void close() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    closed_ = true;
-    cond_pop_.notify_all();
-    cond_push_.notify_all();
-  }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return queue_.empty();
-  }
-
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return queue_.size();
-  }
-
-private:
-  mutable std::mutex mutex_;
-  std::queue<T> queue_;
-  size_t max_size_;
-  std::condition_variable cond_push_;
-  std::condition_variable cond_pop_;
-  bool closed_;
-};
-
 // 全局日志缓冲队列（背压大小限制为 1000 个 Batch）
 SafeQueue<LogTask> g_log_queue(1000);
 
 // --- 生产级设计 2：断点续传（持久化 Checkpoint） ---
-std::string g_checkpoint_file = "ob_cdc_checkpoint.txt";
-
-void set_checkpoint_file(const uint64_t tenant_id, const share::ObLSID &ls_id) {
-  g_checkpoint_file = "ob_cdc_checkpoint_t" + std::to_string(tenant_id)
-                    + "_ls" + std::to_string(ls_id.id()) + ".txt";
-}
-
-// 写入 LSN 断点到本地存储文件
-void save_checkpoint(const palf::LSN &lsn) {
-  std::ofstream fs(g_checkpoint_file, std::ios::trunc);
-  if (fs.is_open()) {
-    fs << lsn.val_;
-    fs.close();
-  }
-}
-
-// 启动时加载历史 LSN 断点，实现故障恢复
-bool load_checkpoint(palf::LSN &lsn) {
-  std::ifstream fs(g_checkpoint_file);
-  if (fs.is_open()) {
-    uint64_t val = 0;
-    if (fs >> val) {
-      lsn.val_ = val;
-      fs.close();
-      return true;
-    }
-    fs.close();
-  }
-  return false;
-}
+const CheckpointStore *g_checkpoint_store = nullptr;
 
 // Forward declaration of the Pull Manager
 class LSPullManager;
@@ -167,7 +85,7 @@ public:
     void *buf = nullptr;
     ProductionLogCB *cb = nullptr;
     if (OB_ISNULL(buf = alloc(sizeof(ProductionLogCB)))) {
-      std::cerr << get_time_prefix() << "[RPC CB] clone failed due to memory allocation failure." << std::endl;
+      CDC_ERROR() << get_time_prefix() << "[RPC CB] clone failed due to memory allocation failure.";
     } else {
       cb = new(buf) ProductionLogCB();
     }
@@ -192,15 +110,15 @@ public:
       if (task.log_num > 0 && result.get_log_entry_buf() != nullptr) {
         task.log_data.assign(result.get_log_entry_buf(), result.get_pos());
       }
-      g_log_queue.push(std::move(task));
+      g_log_queue.push(std::move(task), g_running);
 
       // 提取最新的 next_req_lsn 用于唤醒后的下一轮调用
       palf::LSN next_lsn = result.get_next_req_lsn();
       g_next_lsn_val = next_lsn.is_valid() ? next_lsn.val_ : current_lsn_val;
       g_rpc_success = true;
     } else {
-      std::cerr << get_time_prefix() << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
-                << ", biz_err=" << result.get_err() << std::endl;
+      CDC_ERROR() << get_time_prefix() << "[RPC CB] Error in fetching logs: rcode=" << rcode.rcode_
+                << ", biz_err=" << result.get_err();
       g_rpc_success = false;
     }
 
@@ -217,7 +135,7 @@ public:
 
   // 超时回调处理
   void on_timeout() override {
-    std::cerr << get_time_prefix() << "[RPC CB] Request timeout." << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[RPC CB] Request timeout.";
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -228,7 +146,7 @@ public:
 
   // 包异常毁坏回调
   void on_invalid() override {
-    std::cerr << get_time_prefix() << "[RPC CB] Invalid response packet." << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[RPC CB] Invalid response packet.";
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -277,7 +195,7 @@ void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
   int64_t timeout_us = 5000000; // 5秒超时
   int ret = rpc_.async_stream_fetch_log(tenant_id_, svr_, req, g_pull_cb, timeout_us);
   if (ret != OB_SUCCESS) {
-    std::cerr << get_time_prefix() << "[Pull Manager] async_stream_fetch_log trigger fail, err: " << ret << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[Pull Manager] async_stream_fetch_log trigger fail, err: " << ret;
     g_rpc_success = false;
     {
       std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -289,12 +207,12 @@ void LSPullManager::trigger_fetch(const palf::LSN &start_lsn) {
 
 // --- 生产级设计 4：后台高性能消费线程与物理 CLOG 解码模块 (Module 2) ---
 void consumer_worker_thread() {
-  std::cout << get_time_prefix() << "[Consumer] Consumer worker thread started." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Consumer] Consumer worker thread started.";
   LogTask task;
   
   while (g_running || !g_log_queue.empty()) {
     // 从安全队列中 Pop 任务，100ms 超时用于优雅检测系统退出信号
-    if (g_log_queue.pop(task, std::chrono::milliseconds(100))) {
+    if (g_log_queue.pop(task, std::chrono::milliseconds(100), g_running)) {
       
       // 1. 进行深度的物理 CLOG 二进制包解码与消费 (Module 2)
       if (task.log_num > 0 && !task.log_data.empty()) {
@@ -306,7 +224,7 @@ void consumer_worker_thread() {
         // 遍历这批数据中的每一个物理日志组 Entry (GroupEntry)
         for (int64_t idx = 0; idx < task.log_num; ++idx) {
           if (pos >= len) {
-            std::cerr << get_time_prefix() << "  [Parser] Error: pos exceeds log data len!" << std::endl;
+            CDC_ERROR() << get_time_prefix() << "  [Parser] Error: pos exceeds log data len!";
             break;
           }
 
@@ -314,8 +232,8 @@ void consumer_worker_thread() {
           IGroupEntry group_entry(true /* enable_logservice */);
           int parse_ret = group_entry.deserialize(current_lsn, buf, len, pos);
           if (parse_ret != OB_SUCCESS) {
-            std::cerr << get_time_prefix() << "  [Parser] Failed to deserialize IGroupEntry, err=" << parse_ret 
-                      << ", pos=" << pos << "/" << len << std::endl;
+            CDC_ERROR() << get_time_prefix() << "  [Parser] Failed to deserialize IGroupEntry, err=" << parse_ret 
+                      << ", pos=" << pos << "/" << len;
             break;
           }
           
@@ -331,8 +249,8 @@ void consumer_worker_thread() {
             int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             if (now_ms - last_paxos_time > 60000) {
-              std::cout << get_time_prefix() << "[Consumer] [Paxos Alive] LSN: " << current_lsn.val_
-                        << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts() << std::endl;
+              CDC_INFO() << get_time_prefix() << "[Consumer] [Paxos Alive] LSN: " << current_lsn.val_
+                        << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts();
               last_paxos_time = now_ms;
             }
 
@@ -355,7 +273,7 @@ void consumer_worker_thread() {
                 ILogEntry log_entry(true);
                 int entry_ret = log_entry.deserialize(current_lsn, group_data_buf, group_data_len, entry_pos);
                 if (entry_ret != OB_SUCCESS) {
-                  std::cerr << get_time_prefix() << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret << std::endl;
+                  CDC_ERROR() << get_time_prefix() << "    [Parser] Failed to deserialize ILogEntry, err=" << entry_ret;
                   break;
                 }
 
@@ -364,18 +282,18 @@ void consumer_worker_thread() {
                   if (log_type == TRANS_SERVICE_LOG_BASE_TYPE) {
                     parse_tx_redo_logs(log_entry, current_lsn);
                   } else if (!printed_group_header) {
-                    std::cout << get_time_prefix() << "[Consumer] [" << cdc_log_kind(log_type)
+                    CDC_INFO() << get_time_prefix() << "[Consumer] [" << cdc_log_kind(log_type)
                               << "] LSN: " << current_lsn.val_
                               << ", SCN_GTS: " << group_entry.get_scn().get_val_for_gts()
                               << ", log_entries_count: " << task.log_num
                               << ", bytes: " << task.log_data.size()
-                              << ", GroupDataLen: " << group_entry.get_data_len() << std::endl;
+                              << ", GroupDataLen: " << group_entry.get_data_len();
                     printed_group_header = true;
 
-                    std::cout << get_time_prefix() << "    -> [LogEntry " << entry_idx << "] type="
+                    CDC_INFO() << get_time_prefix() << "    -> [LogEntry " << entry_idx << "] type="
                               << log_base_type_name(log_type)
                               << ", DataLen: " << log_entry.get_data_len()
-                              << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts() << std::endl;
+                              << ", SCN_GTS: " << log_entry.get_scn().get_val_for_gts();
                   }
                 }
                 ++entry_idx;
@@ -396,9 +314,9 @@ void consumer_worker_thread() {
 
         ++suppressed_keepalive_count;
         if (last_printed_time == 0 || now_ms - last_printed_time > 60000) {
-          std::cout << get_time_prefix() << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_
+          CDC_INFO() << get_time_prefix() << "[Consumer] [Keep-Alive] Watermark advance. LSN: " << task.lsn.val_
                     << ", suppressed=" << (suppressed_keepalive_count - 1)
-                    << ", previous_lsn=" << last_printed_lsn << std::endl;
+                    << ", previous_lsn=" << last_printed_lsn;
           last_printed_lsn = task.lsn.val_;
           last_printed_time = now_ms;
           suppressed_keepalive_count = 0;
@@ -406,17 +324,19 @@ void consumer_worker_thread() {
       }
 
       // 2. 消费完成后持久化 Checkpoint！故障重启后将由此恢复
-      save_checkpoint(task.lsn);
+      if (g_checkpoint_store != nullptr) {
+        g_checkpoint_store->save(task.lsn);
+      }
     }
   }
 
-  std::cout << get_time_prefix() << "[Consumer] Consumer worker thread safely terminated." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Consumer] Consumer worker thread safely terminated.";
 }
 
 // --- 生产级设计 5：专属 RPC 轮询驱动线程 (Dedicated RPC Puller Thread) ---
 // 核心职责：在一个显式的、阻塞的主动循环中，以极强的高可用性百分之百确保持续不断地调用 RPC 接口
 void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
-  std::cout << get_time_prefix() << "[Puller] Dedicated RPC pull thread started." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Puller] Dedicated RPC pull thread started.";
   palf::LSN current_lsn = start_lsn;
 
   while (g_running) {
@@ -430,7 +350,7 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
         std::chrono::system_clock::now().time_since_epoch()).count();
 
     if (now_ms - last_pull_time > 60000) {
-      std::cout << get_time_prefix() << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_ << std::endl;
+      CDC_INFO() << get_time_prefix() << "[Puller] Calling RPC async_stream_fetch_log for LSN: " << current_lsn.val_;
       last_pull_time = now_ms;
     }
     manager.trigger_fetch(current_lsn);
@@ -453,51 +373,58 @@ void pull_worker_thread(LSPullManager &manager, palf::LSN start_lsn) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
   }
-  std::cout << get_time_prefix() << "[Puller] Dedicated RPC pull thread safely terminated." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Puller] Dedicated RPC pull thread safely terminated.";
 }
 
 // --- 主程序入口 ---
-int main() {
+int main(int argc, char **argv) {
+  CdcConfig config = CdcConfig::parse(argc, argv);
+  if (!Logger::instance().init(config.log_file, config.log_to_console)) {
+    CDC_ERROR() << get_time_prefix() << "[Main] Failed to open log file: " << config.log_file;
+    return 1;
+  }
+
   // 1. 注册核心优雅退出信号
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
 
   int ret = OB_SUCCESS;
 
-  std::cout << get_time_prefix() << "[Main] Setting self address..." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] Setting self address...";
   get_self_addr().set_ip_addr("127.0.0.1", static_cast<int32_t>(getpid()));
 
-  std::cout << get_time_prefix() << "[Main] Initializing ObLogConfig..." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] Initializing ObLogConfig...";
   TCONF.init();
   std::map<std::string, std::string> configs;
   TCONF.load_from_map(configs);
 
-  std::cout << get_time_prefix() << "[Main] Initializing ObLogRpc..." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] Initializing ObLogRpc...";
   ObLogRpc rpc;
   int64_t io_thread_num = 2; // 生产环境配置为 2 个 or 更多线程
   ret = rpc.init(io_thread_num);
   if (OB_SUCCESS != ret) {
-    std::cerr << get_time_prefix() << "[Main] ObLogRpc init failed, err: " << ret << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[Main] ObLogRpc init failed, err: " << ret;
     return ret;
   }
-  std::cout << get_time_prefix() << "[Main] ObLogRpc initialized successfully!" << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] ObLogRpc initialized successfully!";
 
   // 定位所需参数
-  uint64_t tenant_id = 1006;
-  ObAddr svr(ObAddr::IPV4, "192.168.31.205", 2882);
-  share::ObLSID ls_id(1001);
-  set_checkpoint_file(tenant_id, ls_id);
-  std::cout << get_time_prefix() << "[Main] Using checkpoint file: " << g_checkpoint_file << std::endl;
+  uint64_t tenant_id = config.tenant_id;
+  ObAddr svr(ObAddr::IPV4, config.server_host.c_str(), config.server_port);
+  share::ObLSID ls_id(config.ls_id);
+  CheckpointStore checkpoint_store(config.checkpoint_file);
+  g_checkpoint_store = &checkpoint_store;
+  CDC_INFO() << get_time_prefix() << "[Main] Using checkpoint file: " << checkpoint_store.file_path();
 
   palf::LSN start_lsn;
-  bool has_checkpoint = load_checkpoint(start_lsn);
+  bool has_checkpoint = checkpoint_store.load(start_lsn);
 
   if (has_checkpoint) {
     // 优先从历史断点恢复
-    std::cout << get_time_prefix() << "[Main] Found checkpoint! Resuming redo log stream from LSN: " << start_lsn.val_ << std::endl;
+    CDC_INFO() << get_time_prefix() << "[Main] Found checkpoint! Resuming redo log stream from LSN: " << start_lsn.val_;
   } else {
     // 无历史断点，根据当前系统时间定位起始 LSN（含启动重试机制）
-    std::cout << get_time_prefix() << "[Main] No checkpoint found. Locating start LSN by system time..." << std::endl;
+    CDC_INFO() << get_time_prefix() << "[Main] No checkpoint found. Locating start LSN by system time...";
     
     obrpc::ObCdcReqStartLSNByTsReq req;
     obrpc::ObCdcReqStartLSNByTsReq::LocateParam param;
@@ -516,10 +443,10 @@ int main() {
       ret = rpc.req_start_lsn_by_tstamp(tenant_id, svr, req, resp, timeout);
       if (OB_SUCCESS == ret && resp.get_results().count() > 0) {
         start_lsn = resp.get_results().at(0).start_lsn_;
-        std::cout << get_time_prefix() << "[Main] Successfully located start LSN: " << start_lsn.val_ << std::endl;
+        CDC_INFO() << get_time_prefix() << "[Main] Successfully located start LSN: " << start_lsn.val_;
         break;
       } else {
-        std::cerr << get_time_prefix() << "[Main] Failed to locate start LSN (err=" << ret << "). Retrying in 3 seconds..." << std::endl;
+        CDC_ERROR() << get_time_prefix() << "[Main] Failed to locate start LSN (err=" << ret << "). Retrying in 3 seconds...";
         std::this_thread::sleep_for(std::chrono::seconds(3));
       }
     }
@@ -543,7 +470,7 @@ int main() {
   }
 
   // --- 6. 生产级优雅关闭链条 ---
-  std::cout << get_time_prefix() << "[Main] Stopping RPC and clearing queues..." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] Stopping RPC and clearing queues...";
   g_log_queue.close(); // 唤醒并关闭消费队列，使消费者停止
 
   if (pull_thread.joinable()) {
@@ -560,7 +487,7 @@ int main() {
   }
 
   rpc.destroy(); // 销毁 RPC 服务，断开与 Observer 的网络连接
-  std::cout << get_time_prefix() << "[Main] ObLogRpc destroyed. System shutdown complete." << std::endl;
+  CDC_INFO() << get_time_prefix() << "[Main] ObLogRpc destroyed. System shutdown complete.";
 
   return 0;
 }

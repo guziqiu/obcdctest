@@ -1,2 +1,0 @@
-cmake -DCMAKE_C_COMPILER=/usr/local/code/oceanbase/deps/3rd/usr/local/oceanbase/devtools/bin/clang \
-   -DCMAKE_CXX_COMPILER=/usr/local/code/oceanbase/deps/3rd/usr/local/oceanbase/devtools/bin/clang++-17 .. && make

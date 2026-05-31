@@ -1,10 +1,10 @@
 #include "cdc_log_parser.h"
 
-#include <iostream>
-
 #include "lib/ob_errno.h"
 #include "logging_utils.h"
 #include "logservice/ob_log_base_header.h"
+#include "parser/dml_event.h"
+#include "runtime/logger.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 #include "storage/tx/ob_tx_log.h"
 
@@ -100,8 +100,8 @@ int parse_redo_mutator_rows(
   memtable::ObEncryptRowBuf row_buf;
 
   if (OB_SUCCESS != (ret = iter.deserialize(redo_data, redo_data_len, pos, empty_clog_encrypt_info))) {
-    std::cerr << get_time_prefix() << "[Redo] Failed to deserialize mutator iterator, err=" << ret
-              << ", bytes=" << redo_data_len << ", LSN=" << lsn.val_ << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[Redo] Failed to deserialize mutator iterator, err=" << ret
+              << ", bytes=" << redo_data_len << ", LSN=" << lsn.val_;
     return ret;
   }
 
@@ -111,13 +111,21 @@ int parse_redo_mutator_rows(
         || row_header.mutator_type_ == memtable::MutatorType::MUTATOR_ROW_EXT_INFO) {
       const memtable::ObMemtableMutatorRow &row = iter.get_mutator_row();
       if (is_visible_dml_flag(row.dml_flag_)) {
-        std::cout << get_time_prefix() << "    -> [RedoRow " << row_count << "] op="
-                  << dml_flag_name(row.dml_flag_)
-                  << ", tablet_id=" << row_header.tablet_id_.id()
-                  << ", table_id=" << row.table_id_
-                  << ", seq=" << row.seq_no_.get_seq()
-                  << ", branch=" << row.seq_no_.get_branch()
-                  << ", submit_ts=" << submit_ts << std::endl;
+        DmlEvent event;
+        event.op = dml_flag_name(row.dml_flag_);
+        event.tablet_id = row_header.tablet_id_.id();
+        event.table_id = row.table_id_;
+        event.seq = row.seq_no_.get_seq();
+        event.branch = row.seq_no_.get_branch();
+        event.submit_ts = submit_ts;
+        event.lsn = lsn.val_;
+        CDC_INFO() << get_time_prefix() << "    -> [RedoRow " << row_count << "] op="
+                  << event.op
+                  << ", tablet_id=" << event.tablet_id
+                  << ", table_id=" << event.table_id
+                  << ", seq=" << event.seq
+                  << ", branch=" << event.branch
+                  << ", submit_ts=" << event.submit_ts;
         ++row_count;
       }
     }
@@ -126,8 +134,8 @@ int parse_redo_mutator_rows(
   if (OB_ITER_END == ret) {
     ret = OB_SUCCESS;
   } else if (OB_SUCCESS != ret) {
-    std::cerr << get_time_prefix() << "[Redo] Failed to iterate mutator rows, err=" << ret
-              << ", LSN=" << lsn.val_ << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[Redo] Failed to iterate mutator rows, err=" << ret
+              << ", LSN=" << lsn.val_;
   }
 
   return ret;
@@ -145,8 +153,8 @@ void parse_tx_redo_logs(const ipalf::ILogEntry &log_entry, const palf::LSN &lsn)
   transaction::ObTxLogBlock tx_log_block;
   int ret = tx_log_block.init_for_replay(buf, len);
   if (OB_SUCCESS != ret) {
-    std::cerr << get_time_prefix() << "[Redo] Failed to init tx log block, err=" << ret
-              << ", LSN=" << lsn.val_ << ", bytes=" << len << std::endl;
+    CDC_ERROR() << get_time_prefix() << "[Redo] Failed to init tx log block, err=" << ret
+              << ", LSN=" << lsn.val_ << ", bytes=" << len;
     return;
   }
 
@@ -159,8 +167,8 @@ void parse_tx_redo_logs(const ipalf::ILogEntry &log_entry, const palf::LSN &lsn)
     if (OB_ITER_END == ret) {
       break;
     } else if (OB_SUCCESS != ret) {
-      std::cerr << get_time_prefix() << "[Redo] Failed to get next tx log, err=" << ret
-                << ", LSN=" << lsn.val_ << std::endl;
+      CDC_ERROR() << get_time_prefix() << "[Redo] Failed to get next tx log, err=" << ret
+                << ", LSN=" << lsn.val_;
       break;
     }
 
@@ -168,25 +176,25 @@ void parse_tx_redo_logs(const ipalf::ILogEntry &log_entry, const palf::LSN &lsn)
       transaction::ObTxRedoLogTempRef tmp_ref;
       transaction::ObTxRedoLog redo_log(tmp_ref);
       if (OB_SUCCESS != (ret = tx_log_block.deserialize_log_body(redo_log))) {
-        std::cerr << get_time_prefix() << "[Redo] Failed to deserialize redo body, err=" << ret
-                  << ", LSN=" << lsn.val_ << std::endl;
+        CDC_ERROR() << get_time_prefix() << "[Redo] Failed to deserialize redo body, err=" << ret
+                  << ", LSN=" << lsn.val_;
         break;
       }
 
       int64_t row_count = 0;
-      std::cout << get_time_prefix() << "[Redo] LSN=" << lsn.val_
+      CDC_INFO() << get_time_prefix() << "[Redo] LSN=" << lsn.val_
                 << ", tx_log=" << tx_log_type_name(tx_log_header.get_tx_log_type())
                 << ", log_entry_no=" << block_header.get_log_entry_no()
                 << ", cluster_version=" << block_header.get_cluster_version()
                 << ", mutator_size=" << redo_log.get_mutator_size()
-                << ", SCN_GTS=" << log_entry.get_scn().get_val_for_gts() << std::endl;
+                << ", SCN_GTS=" << log_entry.get_scn().get_val_for_gts();
       if (OB_SUCCESS == parse_redo_mutator_rows(redo_log.get_replay_mutator_buf(),
                                                 redo_log.get_mutator_size(),
                                                 lsn,
                                                 submit_ts,
                                                 row_count)) {
-        std::cout << get_time_prefix() << "[Redo] Parsed rows=" << row_count
-                  << ", LSN=" << lsn.val_ << std::endl;
+        CDC_INFO() << get_time_prefix() << "[Redo] Parsed rows=" << row_count
+                  << ", LSN=" << lsn.val_;
       }
     }
   }

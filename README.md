@@ -27,13 +27,37 @@
 
 ```text
 .
-├── CMakeLists.txt              # CMake 依赖构建与 pthread、libobcdc 动态库链接配置
-├── build.sh                    # Centos 8.3 容器内快速编译脚本
-├── main.cpp                    # 生产级 CDC 客户端主源码（高可用拉取与原理解码）
-├── ob_cdc_checkpoint.txt       # 本地持久化断点文件（运行后自动生成）
-├── README.md                   # 本项目快速入门指南文档
-├── obcdc_production_solution.md # 深度生产环境设计与架构原理方案手册
-└── obcdc_alternative_design.md   # 自研代替 libobcdc 的底层协议全套设计蓝图
+├── AGENTS.md                               # Codex 项目级指令，包含容器编译方式
+├── CMakeLists.txt                          # CMake 依赖构建与 pthread、libobcdc 动态库链接配置
+├── README.md                               # 本项目快速入门指南文档
+├── app/
+│   ├── cdc_config.cpp                      # 命令行参数解析与默认配置生成
+│   └── cdc_config.h                        # CDC 启动配置结构体
+├── build.sh                                # CentOS 8.3 容器内快速编译脚本
+├── cdc_log_parser.cpp                      # CLOG/事务 redo/DML mutator 解析与日志输出
+├── cdc_log_parser.h                        # 日志解析入口声明
+├── logging_utils.h                         # 时间前缀工具
+├── main.cpp                                # CDC 客户端主流程：RPC 生命周期、拉取线程、消费线程
+├── parser/
+│   └── dml_event.h                         # DML 行事件结构，预留 schema/列值扩展边界
+├── runtime/
+│   ├── checkpoint_store.cpp                # LSN checkpoint 读写
+│   ├── checkpoint_store.h                  # checkpoint 存储接口
+│   ├── logger.cpp                          # 线程安全日志实现，支持终端和文件输出
+│   ├── logger.h                            # CDC_INFO/CDC_ERROR 日志接口
+│   └── safe_queue.h                        # 带背压的线程安全阻塞队列
+├── obcdc_production_solution.md            # 深度生产环境设计与架构原理方案手册
+├── plan.md                                 # 自研 CDC 方案规划草稿
+└── docs/superpowers/plans/
+    └── 2026-05-31-obcdc-refactor.md        # 本轮重构实施计划
+```
+
+运行后可能生成以下文件或目录：
+
+```text
+build/                                      # CMake 构建产物目录
+ob_cdc_checkpoint_t<tenant>_ls<ls>.txt      # 默认 LSN 断点文件
+.codegraph/                                 # 本地代码索引缓存
 ```
 
 ---
@@ -64,23 +88,44 @@ cd /usr/local/code/obcdctest/build
 ./obcdc_rpc_test
 ```
 
+支持的启动参数：
+```bash
+./obcdc_rpc_test \
+  --tenant-id 1006 \
+  --server 192.168.31.205:2882 \
+  --ls-id 1001 \
+  --checkpoint-file ./ob_cdc_checkpoint.txt \
+  --log-file ./logs/obcdc_rpc_test.log
+```
+
+参数说明：
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--tenant-id` | `1006` | 订阅的租户 ID |
+| `--server` | `192.168.31.205:2882` | Observer RPC 地址 |
+| `--ls-id` | `1001` | 订阅的 LS ID |
+| `--checkpoint-file` | `ob_cdc_checkpoint_t<tenant>_ls<ls>.txt` | LSN 断点文件 |
+| `--log-file` | 空 | 配置后同时写入日志文件 |
+| `--no-console-log` | 关闭 | 只写日志文件，不输出到终端 |
+
+默认仍输出到终端；指定 `--log-file` 后，同一份日志会同时写入文件。如果使用 `--no-console-log`，建议必须同时设置 `--log-file`，否则启动后不会看到运行日志。
+
 ### 2) 正常运行日志预期
 当 Observer 连通并开始拉取时，您将看到如下日志输出：
 ```text
-[Main] Successfully located start LSN: 18446744073709551615
-[Consumer] Consumer worker thread started.
-[Puller] Dedicated RPC pull thread started.
-[Puller] Calling RPC async_stream_fetch_log for LSN: 18446744073709551615
-[RPC CB] Error in fetching logs: rcode=0, biz_err=-4002
-[Puller] Calling RPC async_stream_fetch_log for LSN: 18446744073709551615
+[2026-05-31 12:34:56] [Main] Successfully located start LSN: 18446744073709551615
+[2026-05-31 12:34:56] [Consumer] Consumer worker thread started.
+[2026-05-31 12:34:56] [Puller] Dedicated RPC pull thread started.
+[2026-05-31 12:34:56] [Puller] Calling RPC async_stream_fetch_log for LSN: 18446744073709551615
+[2026-05-31 12:34:56] [RPC CB] Error in fetching logs: rcode=0, biz_err=-4002
 ```
 
 当有真实 Redo 日志产生时，消费端开始解码并打印组日志及事务日志记录：
 ```text
-[Consumer] [Success] Processing LSN: 18446744073709551615, log_entries_count: 2, bytes: 512
-  [Parser] [GroupEntry 0] LSN: 18446744073709551615, SCN_GTS: 1780112123952089, DataLen: 480
-    -> [LogEntry 0] DataLen: 220, SCN_GTS: 1780112123952089
-    -> [LogEntry 1] DataLen: 220, SCN_GTS: 1780112123952089
+[2026-05-31 12:34:56] [Redo] LSN=18446744073709551615, tx_log=TX_REDO_LOG, log_entry_no=7, cluster_version=..., mutator_size=384, SCN_GTS=1780112123952089
+[2026-05-31 12:34:56]     -> [RedoRow 0] op=INSERT, tablet_id=200001, table_id=500001, seq=1, branch=0, submit_ts=1780112123952089000
+[2026-05-31 12:34:56] [Redo] Parsed rows=1, LSN=18446744073709551615
 ```
 
 ### 3) 高可用重试验证
